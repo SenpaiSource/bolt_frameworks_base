@@ -1041,10 +1041,33 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
         mScreenBrightnessRampAnimator = mInjector.getDualRampAnimator(mPowerState,
                 DisplayPowerState.SCREEN_BRIGHTNESS_FLOAT,
                 DisplayPowerState.SCREEN_SDR_BRIGHTNESS_FLOAT);
+        mScreenBrightnessRampAnimator.setNitConverter(new RampAnimator.NitConverter() {
+            @Override
+            public float convertToNits(float brightness) {
+                float nits = mDisplayBrightnessController.convertToNits(brightness);
+                if (nits < 0.0f && mDisplayDeviceConfig != null
+                        && mDisplayDeviceConfig.getNits() != null) {
+                    float backlight = mDisplayDeviceConfig.getBacklightFromBrightness(brightness);
+                    nits = mDisplayDeviceConfig.getNitsFromBacklight(backlight);
+                }
+                return nits;
+            }
+
+            @Override
+            public float getBrightnessFromNits(float nits) {
+                float brightness = mDisplayBrightnessController.getBrightnessFromNits(nits);
+                if (!BrightnessUtils.isValidBrightnessValue(brightness)
+                        && mDisplayDeviceConfig != null
+                        && mDisplayDeviceConfig.getNits() != null) {
+                    float backlight = mDisplayDeviceConfig.getBacklightFromNits(nits);
+                    brightness = mDisplayDeviceConfig.getBrightnessFromBacklight(backlight);
+                }
+                return brightness;
+            }
+        });
         setAnimatorConfig(mAutomaticBrightnessController != null
                 && mAutomaticBrightnessController.isInIdleMode());
         mScreenBrightnessRampAnimator.setListener(mRampAnimatorListener);
-
         noteScreenState(mPowerState.getScreenState(), Display.STATE_REASON_DEFAULT_POLICY);
         noteScreenBrightness(mPowerState.getScreenBrightness());
 
@@ -1306,6 +1329,9 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
     private final RampAnimator.Listener mRampAnimatorListener = new RampAnimator.Listener() {
         @Override
         public void onAnimationEnd() {
+            if (mAutomaticBrightnessController != null) {
+                mAutomaticBrightnessController.setBrightnessAnimating(false);
+            }
             sendUpdatePowerState();
             Message msg = mHandler.obtainMessage(MSG_BRIGHTNESS_RAMP_DONE);
             mHandler.sendMessageAtTime(msg, mClock.uptimeMillis());
@@ -1559,7 +1585,7 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 }
             }
 
-            final boolean initialRampSkip = (state == Display.STATE_ON && mSkipRampState
+            boolean initialRampSkip = (state == Display.STATE_ON && mSkipRampState
                     != RAMP_STATE_SKIP_NONE) || mDisplayPowerProximityStateController
                     .shouldSkipRampBecauseOfProximityChangeToNegative();
             // While dozing, sometimes the brightness is split into buckets. Rather than animating
@@ -1604,9 +1630,12 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 mBrightnessReasonTemp.addModifier(BrightnessReason.MODIFIER_HDR);
             }
 
-            // if doze or suspend state is requested, we want to finish brightnes animation fast
-            // to allow state animation to start
-            if (mPowerRequest.policy == POLICY_DOZE
+            // If transitioning into doze/suspend from active screen, finish brightness animation
+            // fast unless this is an ongoing smooth AOD ambient brightness update.
+            final boolean isAmbientDozeUpdate = Display.isDozeState(state) && mDozing
+                    && mBrightnessReasonTemp.getReason() == BrightnessReason.REASON_DOZE
+                    && slowChange;
+            if (!isAmbientDozeUpdate && mPowerRequest.policy == POLICY_DOZE
                     && (mPowerRequest.dozeScreenState == Display.STATE_UNKNOWN  // dozing
                     || mPowerRequest.dozeScreenState == Display.STATE_DOZE_SUSPEND
                     || mPowerRequest.dozeScreenState == Display.STATE_ON_SUSPEND)) {
@@ -1614,6 +1643,14 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 slowChange = false;
             }
 
+            // Ensure fallback doze brightness never drops below calibrated doze floor when no
+            // explicit ambient doze brightness override is active.
+            if ((Display.isDozeState(state) || mPowerRequest.policy == POLICY_DOZE)
+                    && !BrightnessUtils.isValidBrightnessValue(mPowerRequest.dozeScreenBrightness)) {
+                brightnessState = Math.max(brightnessState, mScreenBrightnessDozeConfig);
+                animateValue = Math.max(animateValue, mScreenBrightnessDozeConfig);
+                sdrAnimateValue = Math.max(sdrAnimateValue, mScreenBrightnessDozeConfig);
+            }
             final float currentBrightness = mPowerState.getScreenBrightness();
             final float currentSdrBrightness = mPowerState.getSdrScreenBrightness();
 
@@ -1624,7 +1661,7 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                         || !isDisplayContentVisible || brightnessIsTemporary;
                 final boolean isHdrOnlyChange = BrightnessSynchronizer.floatEquals(
                         sdrAnimateValue, currentSdrBrightness);
-                if (mFlags.isFastHdrTransitionsEnabled() && !skipAnimation && isHdrOnlyChange) {
+                if (!skipAnimation && isHdrOnlyChange) {
                     // SDR brightness is unchanged, so animate quickly as this is only impacting
                     // a likely minority amount of display content
                     // ie, the highlights of an HDR video or UltraHDR image
@@ -1633,6 +1670,13 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                     // display configuration. For now just do the fast animation
                     slowChange = false;
                 }
+                final boolean useAutoStepper = slowChange && !brightnessIsTemporary
+                        && !skipAnimation && customAnimationRate <= 0
+                        && (mAutomaticBrightnessStrategy.isAutoBrightnessEnabled()
+                                || isAmbientDozeUpdate);
+                final float accelerateScale = (mAutomaticBrightnessController != null)
+                        ? mAutomaticBrightnessController.getAccelerateScale() : 1.0f;
+                mScreenBrightnessRampAnimator.setAutoStepperParams(useAutoStepper, accelerateScale);
                 if (skipAnimation) {
                     animateScreenBrightness(animateValue, sdrAnimateValue,
                             SCREEN_ANIMATION_RATE_MINIMUM);
@@ -1654,10 +1698,14 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                     } else {
                         rampSpeed = mBrightnessRampRateFastDecrease;
                     }
+                    setAnimatorConfig(idle);
                     animateScreenBrightness(animateValue, sdrAnimateValue, rampSpeed);
                 }
+                if (mAutomaticBrightnessController != null) {
+                    mAutomaticBrightnessController.setBrightnessAnimating(
+                            mScreenBrightnessRampAnimator.isAnimating());
+                }
             }
-
             notifyBrightnessTrackerChanged(brightnessState, userInitiatedChange,
                     wasShortTermModelActive, mAutomaticBrightnessStrategy.isAutoBrightnessEnabled(),
                     brightnessIsTemporary, displayBrightnessState.getShouldUseAutoBrightness());
